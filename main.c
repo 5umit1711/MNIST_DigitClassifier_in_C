@@ -1,6 +1,9 @@
 
 #define _CRT_SECURE_NO_WARNINGS
 
+#include <errno.h>
+#include <stdlib.h>
+
 #include "base.h"
 #include "arena.h"
 #include "prng.h"
@@ -159,8 +162,218 @@ void model_train(
 void draw_mnist_digit(f32* data);
 void create_mnist_model(mem_arena* arena, model_context* model);
 
-int main(void) {
+enum {
+    MODEL_FILE_MAGIC = 0x4D4E4953,
+    MODEL_FILE_VERSION = 1,
+    MODEL_LOAD_ERROR = -1,
+    MODEL_LOAD_NOT_FOUND = 0,
+    MODEL_LOAD_OK = 1,
+};
+
+static const char* MODEL_FILENAME = "mnist_model.bin";
+
+b32 model_save(model_context* model, const char* filename) {
+    FILE* file = fopen(filename, "wb");
+    if (file == NULL) {
+        perror(filename);
+        return false;
+    }
+
+    u32 parameter_count = 0;
+    for (u32 i = 0; i < model->cost_prog.size; i++) {
+        if (model->cost_prog.vars[i]->flags & MV_FLAG_PARAMETER) {
+            parameter_count++;
+        }
+    }
+
+    u32 header[] = { MODEL_FILE_MAGIC, MODEL_FILE_VERSION, parameter_count };
+    b32 success = fwrite(header, sizeof(header), 1, file) == 1;
+
+    for (u32 i = 0; success && i < model->cost_prog.size; i++) {
+        model_var* parameter = model->cost_prog.vars[i];
+        if ((parameter->flags & MV_FLAG_PARAMETER) == 0) {
+            continue;
+        }
+
+        u32 shape[] = { parameter->val->rows, parameter->val->cols };
+        u64 value_count = (u64)parameter->val->rows * parameter->val->cols;
+        success =
+            fwrite(shape, sizeof(shape), 1, file) == 1 &&
+            fwrite(parameter->val->data, sizeof(f32), value_count, file) == value_count;
+    }
+
+    if (fclose(file) != 0) {
+        success = false;
+    }
+
+    if (!success) {
+        fprintf(stderr, "Failed to write model file: %s\n", filename);
+    }
+    return success;
+}
+
+i32 model_load(model_context* model, const char* filename) {
+    FILE* file = fopen(filename, "rb");
+    if (file == NULL) {
+        if (errno == ENOENT) {
+            return MODEL_LOAD_NOT_FOUND;
+        }
+        perror(filename);
+        return MODEL_LOAD_ERROR;
+    }
+
+    u32 header[3];
+    b32 success =
+        fread(header, sizeof(header), 1, file) == 1 &&
+        header[0] == MODEL_FILE_MAGIC &&
+        header[1] == MODEL_FILE_VERSION;
+
+    u32 expected_parameter_count = 0;
+    for (u32 i = 0; i < model->cost_prog.size; i++) {
+        if (model->cost_prog.vars[i]->flags & MV_FLAG_PARAMETER) {
+            expected_parameter_count++;
+        }
+    }
+    success = success && header[2] == expected_parameter_count;
+
+    for (u32 i = 0; success && i < model->cost_prog.size; i++) {
+        model_var* parameter = model->cost_prog.vars[i];
+        if ((parameter->flags & MV_FLAG_PARAMETER) == 0) {
+            continue;
+        }
+
+        u32 shape[2];
+        u64 value_count = (u64)parameter->val->rows * parameter->val->cols;
+        success =
+            fread(shape, sizeof(shape), 1, file) == 1 &&
+            shape[0] == parameter->val->rows &&
+            shape[1] == parameter->val->cols &&
+            fread(parameter->val->data, sizeof(f32), value_count, file) == value_count;
+    }
+
+    if (success && (fgetc(file) != EOF || ferror(file))) {
+        success = false;
+    }
+    fclose(file);
+
+    if (!success) {
+        fprintf(stderr, "Model file is invalid or incompatible: %s\n", filename);
+        return MODEL_LOAD_ERROR;
+    }
+    return MODEL_LOAD_OK;
+}
+
+static b32 parse_test_index(const char* text, u32* index) {
+    char* end = NULL;
+    unsigned long value = strtoul(text, &end, 10);
+    if (text[0] == '\0' || end == text || *end != '\0' || value >= 10000) {
+        return false;
+    }
+    *index = (u32)value;
+    return true;
+}
+
+static b32 parse_test_count(const char* text, u32* count) {
+    char* end = NULL;
+    unsigned long value = strtoul(text, &end, 10);
+    if (text[0] == '\0' || end == text || *end != '\0' ||
+        value == 0 || value > 10000) {
+        return false;
+    }
+    *count = (u32)value;
+    return true;
+}
+
+static u32 label_argmax(matrix* labels, u32 index) {
+    matrix label = {
+        .rows = 1,
+        .cols = labels->cols,
+        .data = labels->data + (u64)index * labels->cols
+    };
+    return (u32)mat_argmax(&label);
+}
+
+static void print_prediction(
+    model_context* model, matrix* images, matrix* labels, u32 index, b32 show_image
+) {
+    memcpy(model->input->val->data, images->data + (u64)index * images->cols,
+        sizeof(f32) * images->cols);
+    model_feedforward(model);
+
+    u32 predicted = (u32)mat_argmax(model->output->val);
+    u32 actual = label_argmax(labels, index);
+
+    if (show_image) {
+        draw_mnist_digit(images->data + (u64)index * images->cols);
+    }
+    printf(
+        "Test image %u: actual %u, predicted %u (confidence %.1f%%)%s\n",
+        index, actual, predicted, model->output->val->data[predicted] * 100.0f,
+        actual == predicted ? "" : "  INCORRECT"
+    );
+}
+
+static void evaluate_model(
+    model_context* model, matrix* images, matrix* labels, u32 count
+) {
+    u32 correct = 0;
+    u32 correct_by_digit[10] = { 0 };
+    u32 total_by_digit[10] = { 0 };
+
+    for (u32 i = 0; i < count; i++) {
+        memcpy(model->input->val->data, images->data + (u64)i * images->cols,
+            sizeof(f32) * images->cols);
+        model_feedforward(model);
+
+        u32 actual = label_argmax(labels, i);
+        u32 predicted = (u32)mat_argmax(model->output->val);
+        total_by_digit[actual]++;
+        if (predicted == actual) {
+            correct++;
+            correct_by_digit[actual]++;
+        }
+    }
+
+    printf("Accuracy: %u / %u (%.2f%%)\n", correct, count,
+        (f32)correct / count * 100.0f);
+    for (u32 digit = 0; digit < 10; digit++) {
+        if (total_by_digit[digit] != 0) {
+            printf("Digit %u: %u / %u (%.2f%%)\n", digit,
+                correct_by_digit[digit], total_by_digit[digit],
+                (f32)correct_by_digit[digit] / total_by_digit[digit] * 100.0f);
+        }
+    }
+}
+
+static void print_usage(const char* program) {
+    printf(
+        "Usage:\n"
+        "  %s                 Load saved model (train and save if none exists), then test\n"
+        "  %s train           Train and save the model\n"
+        "  %s test [count]    Test the first count test images (default: all 10000)\n"
+        "  %s predict [index ...]  Show predictions for test image indexes (default: 0-9)\n",
+        program, program, program, program
+    );
+}
+
+int main(int argc, char** argv) {
+    const char* command = argc > 1 ? argv[1] : "auto";
+    if (strcmp(command, "auto") != 0 && strcmp(command, "train") != 0 &&
+        strcmp(command, "test") != 0 && strcmp(command, "predict") != 0) {
+        print_usage(argv[0]);
+        return 1;
+    }
+
+    if (strcmp(command, "test") == 0 && argc > 3) {
+        print_usage(argv[0]);
+        return 1;
+    }
+
     mem_arena* perm_arena = arena_create(GiB(1), MiB(1));
+    if (perm_arena == NULL) {
+        fprintf(stderr, "Failed to allocate memory for the MNIST model.\n");
+        return 1;
+    }
 
     matrix* train_images = mat_load(perm_arena, 60000, 784, "train_images.mat");
     matrix* test_images = mat_load(perm_arena, 10000, 784, "test_images.mat");
@@ -182,24 +395,9 @@ int main(void) {
         }
     }
 
-    draw_mnist_digit(test_images->data);
-    for (u32 i = 0; i < 10; i++) {
-        printf("%.0f ", test_labels->data[i]);
-    }
-    printf("\n\n");
-
     model_context* model = model_create(perm_arena);
     create_mnist_model(perm_arena, model);
     model_compile(perm_arena, model);
-
-    memcpy(model->input->val->data, test_images->data, sizeof(f32) * 784);
-    model_feedforward(model);
-
-    printf("pre-training output: ");
-    for (u32 i = 0; i < 10; i++) {
-        printf("%.2f ", model->output->val->data[i]);
-    }
-    printf("\n");
 
     model_training_desc training_desc = {
         .train_images = train_images,
@@ -211,16 +409,67 @@ int main(void) {
         .batch_size = 50,
         .learning_rate = 0.01f
     };
-    model_train(model, &training_desc);
-    
-    memcpy(model->input->val->data, test_images->data, sizeof(f32) * 784);
-    model_feedforward(model);
-    printf("post-training output: ");
-    for (u32 i = 0; i < 10; i++) {
-        printf("%f ", model->output->val->data[i]);
-    }
-    printf("\n\n");
 
+    i32 load_status = MODEL_LOAD_NOT_FOUND;
+    if (strcmp(command, "train") != 0) {
+        load_status = model_load(model, MODEL_FILENAME);
+    }
+
+    if (load_status == MODEL_LOAD_ERROR) {
+        arena_destroy(perm_arena);
+        return 1;
+    }
+
+    b32 should_train = strcmp(command, "train") == 0 ||
+        (strcmp(command, "auto") == 0 && load_status == MODEL_LOAD_NOT_FOUND);
+    if (should_train) {
+        printf("Training model...\n");
+        model_train(model, &training_desc);
+        if (!model_save(model, MODEL_FILENAME)) {
+            arena_destroy(perm_arena);
+            return 1;
+        }
+        printf("Saved trained model to %s\n", MODEL_FILENAME);
+    } else if (load_status == MODEL_LOAD_OK) {
+        printf("Loaded trained model from %s\n", MODEL_FILENAME);
+    } else {
+        fprintf(stderr, "No saved model found. Run '%s train' first.\n", argv[0]);
+        arena_destroy(perm_arena);
+        return 1;
+    }
+
+    if (strcmp(command, "predict") == 0) {
+        if (argc == 2) {
+            for (u32 i = 0; i < 10; i++) {
+                print_prediction(model, test_images, test_labels, i, true);
+            }
+        } else {
+            for (i32 arg = 2; arg < argc; arg++) {
+                u32 index;
+                if (!parse_test_index(argv[arg], &index)) {
+                    fprintf(stderr, "Invalid test image index: %s (use 0-9999)\n", argv[arg]);
+                    arena_destroy(perm_arena);
+                    return 1;
+                }
+                print_prediction(model, test_images, test_labels, index, true);
+            }
+        }
+    } else {
+        u32 count = 10000;
+        if (strcmp(command, "test") == 0 && argc == 3 &&
+            !parse_test_count(argv[2], &count)) {
+            fprintf(stderr, "Test count must be between 1 and 10000.\n");
+            arena_destroy(perm_arena);
+            return 1;
+        }
+        evaluate_model(model, test_images, test_labels, count);
+        if (strcmp(command, "auto") == 0) {
+            printf("\nSample predictions:\n");
+            for (u32 i = 0; i < 10; i++) {
+                print_prediction(model, test_images, test_labels, i, false);
+            }
+        }
+    }
 
     arena_destroy(perm_arena);
 
