@@ -13,7 +13,6 @@
 
 typedef struct {
     u32 rows, cols;
-    // Row-major
     f32* data;
 } matrix;
 
